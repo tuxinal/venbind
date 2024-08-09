@@ -6,8 +6,9 @@ fn main() {
         .define("USE_XINERAMA", "OFF")
         .define("USE_XTEST", "OFF")
         .define("USE_XT", "OFF")
+        .define("CMAKE_INSTALL_LIBDIR", "lib")
         .build();
-    println!("cargo:rustc-link-search=native={}/lib64", dst.display());
+    println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=uiohook");
     println!("cargo:rustc-link-lib=X11");
     println!("cargo:rustc-link-lib=xcb");
