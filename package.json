@@ -1,0 +1,9 @@
+{
+  "name": "venkeybind",
+  "version": "1.0.0",
+  "description": "",
+  "types": "./lib/venkeybind.d.ts",
+  "scripts": {},
+  "keywords": [],
+  "author": "Tuxinal"
+}

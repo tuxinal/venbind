@@ -1,0 +1,10 @@
+[package]
+name = "uiohook-sys"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.69.4"
+cmake = "0.1.50"
