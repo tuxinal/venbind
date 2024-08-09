@@ -37,4 +37,5 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
+          name: ${{ matrix.platform.os }}-${{ matrix.platform.arch }}
           path: ./dist/venkeybind-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.node
