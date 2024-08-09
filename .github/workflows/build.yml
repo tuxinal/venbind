@@ -8,6 +8,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: cachix/install-nix-action@v26
       - uses: cachix/cachix-action@v14
         with:
@@ -20,7 +22,7 @@ jobs:
           cargo build --release
           mkdir dist
           cp ./target/release/libvenkeybind.so ./dist/venkeybind-linux-x64.node
-      - name: upload
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           path: ./dist/venkeybind-linux-x64.node
