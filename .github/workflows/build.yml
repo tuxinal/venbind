@@ -1,0 +1,26 @@
+on: push
+
+name: build and upload artifacts
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v26
+      - uses: cachix/cachix-action@v14
+        with:
+          name: devenv
+      - name: Install devenv.sh
+        run: nix profile install nixpkgs#devenv
+      - name: Build
+        shell: devenv shell bash -- -e {0}
+        run: |
+          cargo build --release
+          mkdir dist
+          cp ./target/release/libvenkeybind.so ./dist/venkeybind-linux-x64.node
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          path: ./dist/venkeybind-linux-x64.node

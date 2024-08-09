@@ -21,9 +21,9 @@ default = ["node"]
 node = ["dep:node-bindgen"]
 
 [workspace]
-members = [
-    "./uiohook-sys"
-]
+members = ["./uiohook-sys"]
 
 [build-dependencies]
-node-bindgen = { version = "6.0", default-features = false, features = ["build"], optional = true }
+node-bindgen = { version = "6.0", default-features = false, features = [
+    "build",
+], optional = true }
