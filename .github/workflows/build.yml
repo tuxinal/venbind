@@ -4,8 +4,20 @@ name: build and upload artifacts
 
 jobs:
   build:
+    name: Build - ${{ matrix.platform.name }}
+    strategy:
+      matrix:
+        platform:
+          # Linux
+          - name: Linux x86_64
+            target: x86_64-unknown-linux-gnu
+            arch: x64
+            os: linux
+          - name: Linux aarch64
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+            os: linux
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,8 +33,8 @@ jobs:
         run: |
           cargo build --release
           mkdir dist
-          cp ./target/release/libvenkeybind.so ./dist/venkeybind-linux-x64.node
+          cp ./target/release/libvenkeybind.so ./dist/venkeybind-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.node
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          path: ./dist/venkeybind-linux-x64.node
+          path: ./dist/venkeybind-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.node
