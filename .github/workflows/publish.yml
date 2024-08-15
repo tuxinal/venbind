@@ -6,7 +6,7 @@ on:
     tags:
       - "*"
 name: publish
-workflows: 
+jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
