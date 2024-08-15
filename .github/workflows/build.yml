@@ -4,17 +4,14 @@ name: build and upload artifacts
 
 jobs:
   build:
-    name: Build - ${{ matrix.platform.name }}
+    name: Build - ${{ matrix.platform.os }} ${{ matrix.arch }}
     strategy:
       matrix:
         platform:
-          - name: Linux ${{ matrix.arch.name }}
-            target: ${{ matrix.arch.name }}-unknown-linux-gnu
-            os: linux
+          - os: linux
+            target_suffix: -unknown-linux-gnu
             output: libvenbind.so
-        arch:
-          - name: x86_64
-          - name: aarch64
+        arch: [x86_64, aarch64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,12 +26,12 @@ jobs:
       - name: Build
         shell: devenv shell bash -- -e {0}
         run: |
-          cargo build --release
+          cargo build --release --target ${{ matrix.arch }}${{ matrix.platform.target_suffix }}
           mkdir dist
-          cp ./target/release/${{ matrix.platform.output }} ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch.name }}.node
+          cp ./target/release/${{ matrix.platform.output }} ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch }}.node
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform.os }}-${{ matrix.arch.name }}
-          path: ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch.name }}.node
+          name: ${{ matrix.platform.os }}-${{ matrix.arch }}
+          path: ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch }}.node
             
