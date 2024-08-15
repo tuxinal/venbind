@@ -28,7 +28,7 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.arch }}${{ matrix.platform.target_suffix }}
           mkdir dist
-          cp ./target/release/${{ matrix.platform.output }} ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch }}.node
+          cp ./target/${{ matrix.arch }}${{ matrix.platform.target_suffix }}/release/${{ matrix.platform.output }} ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch }}.node
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
