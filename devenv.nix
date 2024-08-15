@@ -23,6 +23,14 @@
       enable = true;
       channel = "stable";
       mold.enable = false;
+      targets = [
+        "aarch64-unknown-linux-gnu"
+        "x86_64-unknown-linux-gnu"
+        # "aarch64-pc-windows-msvc"
+        # "aarch64-pc-windows-msvc"
+        # "x86_64-apple-darwin"
+        # "x86_64-apple-darwin"
+      ];
     };
     javascript = {
       enable = true;
