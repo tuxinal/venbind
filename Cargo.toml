@@ -1,6 +1,6 @@
 [package]
-name = "venkeybind"
-version = "0.1.0"
+name = "venbind"
+version = "0.0.1"
 edition = "2021"
 
 [lib]

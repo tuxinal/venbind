@@ -8,15 +8,13 @@ jobs:
     strategy:
       matrix:
         platform:
-          # Linux
-          - name: Linux x86_64
-            target: x86_64-unknown-linux-gnu
-            arch: x64
+          - name: Linux ${{ matrix.arch.name }}
+            target: ${{ matrix.arch.name }}-unknown-linux-gnu
             os: linux
-          - name: Linux aarch64
-            target: aarch64-unknown-linux-gnu
-            arch: arm64
-            os: linux
+            output: libvenbind.so
+        arch:
+          - name: x86_64
+          - name: aarch64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,9 +31,10 @@ jobs:
         run: |
           cargo build --release
           mkdir dist
-          cp ./target/release/libvenkeybind.so ./dist/venkeybind-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.node
+          cp ./target/release/${{ matrix.platform.output }} ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch.name }}.node
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform.os }}-${{ matrix.platform.arch }}
-          path: ./dist/venkeybind-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.node
+          name: ${{ matrix.platform.os }}-${{ matrix.arch.name }}
+          path: ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch.name }}.node
+            

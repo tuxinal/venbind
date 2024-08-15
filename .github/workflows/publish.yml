@@ -1,0 +1,27 @@
+on:
+  workflow_run:
+    workflows: [build and upload artifacts]
+    types: [completed]
+  push:
+    tags:
+      - "*"
+name: publish
+workflows: 
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO: check tag and make sure it matches across tag, package.json, and Cargo.toml
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+      - name: Download artifacts
+        uses: actions/download-artifacts@v4
+        with:
+          path: prebuilds
+      - name: Publish to npm
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

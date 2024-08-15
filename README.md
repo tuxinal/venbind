@@ -1,4 +1,4 @@
-# Venkeybind
+# Venbind
 
 An all-in-one library made to handle shortcuts globally across multiple operating systems and desktops
 

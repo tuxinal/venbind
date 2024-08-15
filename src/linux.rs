@@ -10,7 +10,7 @@ use uiohook_sys::{
 use xcb::Extension;
 use xkbcommon::xkb::{self, State};
 
-use crate::errors::{Result, VenkeybindError};
+use crate::errors::{Result, VenbindError};
 use crate::structs::{Keybind, KeybindId, KeybindTrigger, Keybinds};
 use crate::utils;
 
@@ -27,7 +27,7 @@ pub(crate) fn start_keybinds_internal(
 ) -> Result<()> {
     TX.set(tx).unwrap();
     if utils::is_wayland() {
-        return Err(VenkeybindError::Message("todo".to_owned()));
+        return Err(VenbindError::Message("todo".to_owned()));
     }
     let (connection, _screen) =
         xcb::Connection::connect_with_extensions(None, &[Extension::Xkb], &[]).unwrap();
@@ -57,7 +57,7 @@ pub(crate) fn start_keybinds_internal(
     unsafe {
         hook_set_dispatch_proc(Some(dispatch_proc));
         if hook_run() != UIOHOOK_SUCCESS as i32 {
-            return Err(VenkeybindError::LibUIOHookError);
+            return Err(VenbindError::LibUIOHookError);
         }
     };
     Ok(())
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn dispatch_proc(event_ref: *mut _uiohook_event) {
 
 pub(crate) fn register_keybind_internal(keybind: String, id: KeybindId) -> Result<()> {
     if utils::is_wayland() {
-        return Err(VenkeybindError::Message("todo".to_owned()));
+        return Err(VenbindError::Message("todo".to_owned()));
     }
     let keybind = Keybind::from_string(keybind);
     let mut keybinds = KEYBINDS.lock().unwrap();
@@ -103,7 +103,7 @@ pub(crate) fn register_keybind_internal(keybind: String, id: KeybindId) -> Resul
 }
 pub(crate) fn unregister_keybind_internal(id: KeybindId) -> Result<()> {
     if utils::is_wayland() {
-        return Err(VenkeybindError::Message("todo".to_owned()));
+        return Err(VenbindError::Message("todo".to_owned()));
     }
     let mut keybinds = KEYBINDS.lock().unwrap();
     keybinds.unregister_keybind(id);
