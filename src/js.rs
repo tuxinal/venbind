@@ -5,10 +5,10 @@ use node_bindgen::derive::node_bindgen;
 use crate::structs::{KeybindId, KeybindTrigger};
 
 #[node_bindgen]
-async fn start_keybinds<F: Fn(KeybindId)>(window_id: Option<u32>, callback: F) {
+async fn start_keybinds<F: Fn(KeybindId)>(window_id: Option<usize>, display_id: Option<usize>, callback: F) {
     let (tx, rx) = channel::<KeybindTrigger>();
     thread::spawn(|| {
-        crate::start_keybinds(None, tx);
+        crate::start_keybinds(window_id, display_id, tx);
     });
     loop {
         match rx.recv() {

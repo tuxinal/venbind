@@ -12,8 +12,8 @@ use std::sync::mpsc::Sender;
 use platform::*;
 use structs::{KeybindId, KeybindTrigger};
 
-pub fn start_keybinds(window_id: Option<u64>, tx: Sender<KeybindTrigger>) {
-    start_keybinds_internal(window_id, tx).unwrap();
+pub fn start_keybinds(window_id: Option<usize>, display_id: Option<usize>, tx: Sender<KeybindTrigger>) {
+    start_keybinds_internal(window_id, display_id, tx).unwrap();
 }
 
 pub fn register_keybind(keybind: String, id: KeybindId) {
@@ -32,8 +32,9 @@ mod tests {
     fn demo() {
         let (tx, rx) = channel::<KeybindTrigger>();
         thread::spawn(|| {
-            start_keybinds(None, tx);
+            start_keybinds(None, None, tx);
         });
+        thread::sleep(std::time::Duration::from_secs(1));
         register_keybind("shift+alt+m".to_string(), 1);
         register_keybind("shift+ctrl+a".to_string(), 2);
         loop {
