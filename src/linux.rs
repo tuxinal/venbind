@@ -1,9 +1,11 @@
+use ashpd::desktop::*;
+use ashpd::zbus::export::futures_util::StreamExt;
+use ashpd::WindowIdentifier;
 use core::panic;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::Sender, Mutex};
 use std::sync::{LazyLock, OnceLock};
-use std::sync::atomic::{AtomicBool, Ordering};
-use ashpd::WindowIdentifier;
 use uiohook_sys::{
     _event_type_EVENT_KEY_PRESSED, _uiohook_event, hook_run, hook_set_dispatch_proc,
     UIOHOOK_SUCCESS,
@@ -19,33 +21,52 @@ static KEYBINDS: LazyLock<Mutex<Keybinds>> = LazyLock::new(|| Mutex::new(Keybind
 static TX: OnceLock<Sender<KeybindTrigger>> = OnceLock::new();
 
 static IS_USING_PORTAL: AtomicBool = AtomicBool::new(true);
+static XDG_RUNTIME: LazyLock<tokio::runtime::Runtime> =
+    LazyLock::new(|| tokio::runtime::Runtime::new().unwrap());
+static XDG_STATE: LazyLock<tokio::sync::Mutex<Option<XDGState>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
 
 thread_local! {
     static XKBCOMMON_STATE: RefCell<Option<State>> = RefCell::new(None);
 }
 
+struct XDGState<'a> {
+    portal: global_shortcuts::GlobalShortcuts<'a>,
+    session: Session<'a, ashpd::desktop::global_shortcuts::GlobalShortcuts<'a>>,
+    window_handle: WindowIdentifier,
+}
+
 // window_id should be either a XID if using an X server or a wayland surface handle
 // display_id should be a wayland display handle, or None if using X
 pub(crate) fn start_keybinds_internal(
-    window_id: Option<usize>,
-    display_id: Option<usize>,
+    window_id: Option<u64>,
+    display_id: Option<u64>,
     tx: Sender<KeybindTrigger>,
 ) -> Result<()> {
     TX.set(tx).unwrap();
-    let result = xdg_start_keybinds(window_id, display_id);
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!("Failed to start using XDG Desktop Portals: {}", e);
-            IS_USING_PORTAL.store(false, Ordering::Relaxed);
-            xcb_start_keybinds()
+    let result = if utils::is_wayland() || utils::use_xdg_on_x11() {
+        Some(xdg_start_keybinds(window_id, display_id))
+    } else {
+        None
+    };
+    if let Some(result) = result {
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                eprintln!("Failed to start using XDG Desktop Portals: {}", e);
+                IS_USING_PORTAL.store(false, Ordering::Relaxed);
+                xcb_start_keybinds()
+            }
         }
+    } else {
+        IS_USING_PORTAL.store(false, Ordering::Relaxed);
+        xcb_start_keybinds()
     }
 }
 
 pub(crate) fn register_keybind_internal(keybind: String, id: KeybindId) -> Result<()> {
     if IS_USING_PORTAL.load(Ordering::Relaxed) {
-        Err(VenbindError::Message("todo".to_owned()))
+        xdg_register_keybind(keybind, id)
     } else {
         xcb_register_keybind(keybind, id)
     }
@@ -59,13 +80,8 @@ pub(crate) fn unregister_keybind_internal(id: KeybindId) -> Result<()> {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn xdg_displatch_proc(event_ref: *mut _uiohook_event) {
-
-}
-
 #[inline]
-fn convert_to_pointer<T>(value: Option<usize>) -> *mut T {
+fn convert_to_pointer<T>(value: Option<u64>) -> *mut T {
     assert_eq!(size_of::<usize>(), size_of::<*mut T>());
     match value {
         Some(value) => value as *mut T,
@@ -73,49 +89,112 @@ fn convert_to_pointer<T>(value: Option<usize>) -> *mut T {
     }
 }
 
-fn xdg_start_keybinds(
-    window_id: Option<usize>,
-    display_id: Option<usize>,
-) -> Result<()> {
+fn xdg_start_keybinds(window_id: Option<u64>, display_id: Option<u64>) -> Result<()> {
     use ashpd::desktop::global_shortcuts::*;
 
     if window_id.is_none() {
-        return Err(VenbindError::Message("Window ID is Not Valid".to_owned()));
+        eprintln!("Window ID is not valid trying to create portal anyway");
     }
 
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => return Err(VenbindError::Message("Failed to create tokio runtime".to_owned())),
-    };
-
-    let res = runtime.block_on(async {
+    let res = XDG_RUNTIME.block_on(async {
         let portal = GlobalShortcuts::new().await?;
 
         let session = portal.create_session().await?;
 
         let window_handle = if utils::is_wayland() {
-            if display_id.is_none() {
-                return Err(VenbindError::Message("Wayland requires a valid display handle".to_owned()));
+            if window_id.is_none() || display_id.is_none() {
+                WindowIdentifier::default();
             }
             unsafe {
-                WindowIdentifier::from_wayland_raw(convert_to_pointer(window_id), convert_to_pointer(display_id)).await
+                WindowIdentifier::from_wayland_raw(
+                    convert_to_pointer(window_id),
+                    convert_to_pointer(display_id),
+                )
+                .await
             }
         } else {
-            WindowIdentifier::from_xid(window_id.unwrap() as _)
+            if window_id.is_none() {
+                WindowIdentifier::from_xid(window_id.unwrap() as _)
+            } else {
+                WindowIdentifier::default()
+            }
         };
 
         Ok((portal, session, window_handle))
     });
 
     match res {
-        Ok((portal, session, window_handle)) => { Ok(()) },
-        Err(e) => Err(e),
+        Ok((portal, session, window_handle)) => {
+            let mut state = XDG_STATE.blocking_lock();
+            let _ = state.replace(XDGState {
+                portal,
+                session,
+                window_handle,
+            });
+            XDG_RUNTIME.spawn(xdg_input_thread());
+        }
+        Err(e) => return Err(e),
     }
+
+    Ok(())
+}
+
+async fn xdg_input_thread() {
+    let (mut activated, mut deactivted) = {
+        let state = XDG_STATE.lock().await;
+        if let Some(state) = state.as_ref() {
+            let activated = state.portal.receive_activated().await.unwrap();
+            let deactivated = state.portal.receive_deactivated().await.unwrap();
+            (activated, deactivated)
+        } else {
+            panic!("This Thread should not be active no XDG state");
+        }
+    };
+    loop {
+        while let Some(action) = activated.next().await {
+            let local = action.shortcut_id().to_string();
+            TX.get()
+                .unwrap()
+                .send(KeybindTrigger::Pressed(local.parse().unwrap()))
+                .unwrap()
+        }
+
+        while let Some(action) = deactivted.next().await {
+            let local = action.shortcut_id().to_string();
+            TX.get()
+                .unwrap()
+                .send(KeybindTrigger::Released(local.parse().unwrap()))
+                .unwrap()
+        }
+    }
+}
+
+fn generic_register_keybind(keybind: String, id: KeybindId) {
+    let mut keybinds = KEYBINDS.lock().unwrap();
+    keybinds.register_keybind(Keybind::from_string(keybind.clone()), id);
+}
+
+fn xdg_register_keybind(keybind: String, id: KeybindId) -> Result<()> {
+    use global_shortcuts::NewShortcut;
+    let shortcut = NewShortcut::new(format!("{}", id), id.to_string())
+        .preferred_trigger(Some(keybind.clone().as_str()));
+    let request = XDG_RUNTIME.block_on(async move {
+        let lock = XDG_STATE.lock().await;
+        let state = lock.as_ref().unwrap();
+
+        let res = state
+            .portal
+            .bind_shortcuts(&state.session, &[shortcut], &state.window_handle)
+            .await;
+        generic_register_keybind(keybind, id);
+        res
+    })?;
+    Ok(())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn xcb_dispatch_proc(event_ref: *mut _uiohook_event) {
-    let event = *event_ref;
+    let event = &*event_ref;
     if event.type_ == _event_type_EVENT_KEY_PRESSED {
         XKBCOMMON_STATE.with(|state| {
             if let Some(state) = &*state.borrow() {
@@ -178,9 +257,7 @@ fn xcb_start_keybinds() -> Result<()> {
 }
 
 fn xcb_register_keybind(keybind: String, id: KeybindId) -> Result<()> {
-    let keybind = Keybind::from_string(keybind);
-    let mut keybinds = KEYBINDS.lock().unwrap();
-    keybinds.register_keybind(keybind, id);
+    generic_register_keybind(keybind, id);
     Ok(())
 }
 

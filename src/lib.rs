@@ -12,7 +12,7 @@ use std::sync::mpsc::Sender;
 use platform::*;
 use structs::{KeybindId, KeybindTrigger};
 
-pub fn start_keybinds(window_id: Option<usize>, display_id: Option<usize>, tx: Sender<KeybindTrigger>) {
+pub fn start_keybinds(window_id: Option<u64>, display_id: Option<u64>, tx: Sender<KeybindTrigger>) {
     start_keybinds_internal(window_id, display_id, tx).unwrap();
 }
 
@@ -34,7 +34,7 @@ mod tests {
         thread::spawn(|| {
             start_keybinds(None, None, tx);
         });
-        thread::sleep(std::time::Duration::from_secs(1));
+        thread::sleep(std::time::Duration::from_secs(2));
         register_keybind("shift+alt+m".to_string(), 1);
         register_keybind("shift+ctrl+a".to_string(), 2);
         loop {
