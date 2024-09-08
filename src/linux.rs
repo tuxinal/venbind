@@ -73,11 +73,9 @@ pub(crate) fn register_keybind_internal(keybind: String, id: KeybindId) -> Resul
 }
 
 pub(crate) fn unregister_keybind_internal(id: KeybindId) -> Result<()> {
-    if IS_USING_PORTAL.load(Ordering::Relaxed) {
-        Err(VenbindError::Message("todo".to_owned()))
-    } else {
-        xcb_unregister_keybind(id)
-    }
+    let mut keybinds = KEYBINDS.lock().unwrap();
+    keybinds.unregister_keybind(id);
+    Ok(())
 }
 
 #[inline]
@@ -258,11 +256,5 @@ fn xcb_start_keybinds() -> Result<()> {
 
 fn xcb_register_keybind(keybind: String, id: KeybindId) -> Result<()> {
     generic_register_keybind(keybind, id);
-    Ok(())
-}
-
-fn xcb_unregister_keybind(id: KeybindId) -> Result<()> {
-    let mut keybinds = KEYBINDS.lock().unwrap();
-    keybinds.unregister_keybind(id);
     Ok(())
 }
