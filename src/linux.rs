@@ -101,14 +101,14 @@ fn xdg_start_keybinds(window_id: Option<u64>, display_id: Option<u64>) -> Result
 
         let window_handle = if utils::is_wayland() {
             if window_id.is_none() || display_id.is_none() {
-                WindowIdentifier::default();
-            }
-            unsafe {
-                WindowIdentifier::from_wayland_raw(
-                    convert_to_pointer(window_id),
-                    convert_to_pointer(display_id),
-                )
-                .await
+                WindowIdentifier::default()
+            } else {
+                unsafe {
+                    WindowIdentifier::from_wayland_raw(
+                        convert_to_pointer(window_id),
+                        convert_to_pointer(display_id),
+                    ).await
+                }
             }
         } else {
             if window_id.is_none() {
