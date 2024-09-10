@@ -9,7 +9,7 @@ pub struct Keybinds {
 
 pub enum KeybindTrigger {
     Pressed(KeybindId),
-    Released(KeybindId)
+    Released(KeybindId),
 }
 
 #[derive(PartialEq, Eq, Hash, Debug)]
@@ -31,7 +31,7 @@ impl Keybind {
             "shift" => shift = true,
             "alt" => alt = true,
             "ctrl" => ctrl = true,
-            _ => character = Some(x.to_owned())
+            _ => character = Some(x.to_owned()),
         });
         Self {
             shift,
