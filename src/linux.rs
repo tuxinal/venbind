@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::Sender, Mutex};
 use std::sync::{LazyLock, OnceLock};
+use tokio::task::JoinHandle;
 use uiohook_sys::{
     _event_type_EVENT_KEY_PRESSED, _uiohook_event, hook_run, hook_set_dispatch_proc,
     UIOHOOK_SUCCESS,
@@ -34,6 +35,7 @@ struct XDGState<'a> {
     portal: global_shortcuts::GlobalShortcuts<'a>,
     session: Session<'a, ashpd::desktop::global_shortcuts::GlobalShortcuts<'a>>,
     window_handle: WindowIdentifier,
+    thread_join_handle: JoinHandle<()>,
 }
 
 // window_id should be either a XID if using an X server or a wayland surface handle
@@ -111,8 +113,8 @@ fn xdg_start_keybinds(window_id: Option<u64>, display_id: Option<u64>) -> Result
                 }
             }
         } else {
-            if window_id.is_none() {
-                WindowIdentifier::from_xid(window_id.unwrap() as _)
+            if let Some(window_id) = window_id {
+                WindowIdentifier::from_xid(window_id as _)
             } else {
                 WindowIdentifier::default()
             }
@@ -128,8 +130,8 @@ fn xdg_start_keybinds(window_id: Option<u64>, display_id: Option<u64>) -> Result
                 portal,
                 session,
                 window_handle,
+                thread_join_handle: XDG_RUNTIME.spawn(xdg_input_thread()),
             });
-            XDG_RUNTIME.spawn(xdg_input_thread());
         }
         Err(e) => return Err(e),
     }
