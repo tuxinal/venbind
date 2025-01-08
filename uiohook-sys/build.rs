@@ -9,13 +9,20 @@ fn main() {
         .define("CMAKE_INSTALL_LIBDIR", "lib")
         .build();
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rustc-link-lib=user32");
+    }
     println!("cargo:rustc-link-lib=static=uiohook");
-    println!("cargo:rustc-link-lib=X11");
-    println!("cargo:rustc-link-lib=xcb");
-    println!("cargo:rustc-link-lib=X11-xcb");
-    println!("cargo:rustc-link-lib=xkbcommon-x11");
-    println!("cargo:rustc-link-lib=xkbcommon");
-    println!("cargo:rustc-link-lib=Xtst");
+    #[cfg(target_os = "linux")]
+    {
+        println!("cargo:rustc-link-lib=X11");
+        println!("cargo:rustc-link-lib=xcb");
+        println!("cargo:rustc-link-lib=X11-xcb");
+        println!("cargo:rustc-link-lib=xkbcommon-x11");
+        println!("cargo:rustc-link-lib=xkbcommon");
+        println!("cargo:rustc-link-lib=Xtst");
+    }
     let bindings = bindgen::Builder::default()
         .header("vendor/include/uiohook.h")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
@@ -34,6 +41,17 @@ fn main() {
             .expect("Unable to generate bindings");
         bindings_linux
             .write_to_file(out_path.join("linux_helper_bindings.rs"))
+            .expect("Couldn't write bindings!");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let bindings_windows = bindgen::Builder::default()
+            .header("vendor/src/windows/input_helper.h")
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+            .generate()
+            .expect("Unable to generate bindings");
+        bindings_windows
+            .write_to_file(out_path.join("windows_helper_bindings.rs"))
             .expect("Couldn't write bindings!");
     }
 }

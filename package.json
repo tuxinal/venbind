@@ -4,6 +4,8 @@
   "description": "",
   "types": "./lib/venbind.d.ts",
   "scripts": {},
+  "cpu": ["x64"],
+  "os": ["linux", "win32"],
   "keywords": [],
   "author": "Tuxinal"
 }

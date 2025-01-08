@@ -4,6 +4,7 @@ pub mod js; // BREAKS TESTS
 mod structs;
 
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
+#[cfg_attr(target_os = "windows", path = "windows.rs")]
 mod platform;
 
 use std::sync::mpsc::Sender;
