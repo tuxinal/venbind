@@ -18,7 +18,7 @@ cargo build
 
 - [x] support linux x11
 - [x] support being called through Node API
-- [ ] support linux wayland
+- [x] support linux wayland
 - [x] support windows
 - [ ] support macos
 - [ ] better error handling
