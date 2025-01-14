@@ -13,11 +13,9 @@ jobs:
         platform:
           - os: linux
             target_suffix: -unknown-linux-gnu
-            output: libvenbind.so
           - os: windows
-            target_suffix: -pc-windows-gnu
-            output: venbind.dll
-            build_prefix: npx --yes electron-build-env --electron 31.2.1 --
+            target_suffix: -pc-windows-msvc
+            prebuild_command: cargo install cargo-xwin
         arch: [x86_64]
     runs-on: ubuntu-latest
     steps:
@@ -33,9 +31,10 @@ jobs:
       - name: Build
         shell: devenv shell bash -- -e {0}
         run: |
-          ${{ matrix.platform.build_prefix }} cargo build --release --target ${{ matrix.arch }}${{ matrix.platform.target_suffix }}
+          ${{ matrix.platform.prebuild_command }}
+          npx --yes --package=@napi-rs/cli@canary -- napi build --release --cross-compile --target ${{ matrix.arch }}${{ matrix.platform.target_suffix }}
           mkdir dist
-          cp ./target/${{ matrix.arch }}${{ matrix.platform.target_suffix }}/release/${{ matrix.platform.output }} ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch }}.node
+          cp index.node ./dist/venbind-${{ matrix.platform.os }}-${{ matrix.arch }}.node
       - name: Upload
         uses: actions/upload-artifact@v4
         with:

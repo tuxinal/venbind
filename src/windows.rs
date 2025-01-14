@@ -58,7 +58,6 @@ pub unsafe extern "C" fn dispatch_proc(event_ref: *mut _uiohook_event) {
             },
         };
 
-        println!("{:?}", keybind);
         let keybinds = KEYBINDS.lock();
         if let Some(id) = keybinds.unwrap().get_keybind_id(keybind) {
             TX.get().unwrap().send(KeybindTrigger::Pressed(id)).unwrap();

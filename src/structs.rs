@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::format};
+use std::collections::HashMap;
 
 pub type KeybindId = u32;
 
@@ -57,7 +57,7 @@ impl ToString for Keybind {
             res.push_str("+CTRL");
         }
         if let Some(character) = &self.character {
-            res.push_str(&format!("+{}",character));
+            res.push_str(&format!("+{}", character));
         }
         res.trim_start_matches("+").to_owned()
     }
