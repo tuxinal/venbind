@@ -105,9 +105,18 @@ async fn xdg_input_thread() -> Result<()> {
                 .get()
                 .unwrap()
                 .send(KeybindTrigger::Pressed(activated.shortcut_id().to_owned()))?,
-            Either::Right((Some(deactivated), _)) => TX.get().unwrap().send(
-                KeybindTrigger::Released(deactivated.shortcut_id().to_owned()),
-            )?,
+            Either::Right((Some(deactivated), _)) => {
+                let id = deactivated.shortcut_id().to_owned();
+                let keybinds = KEYBINDS.lock().unwrap();
+                if !keybinds
+                    .get_active_keybinds(&CURR_DOWN.lock().unwrap())
+                    .into_iter()
+                    .any(|x| x == id)
+                {
+                    // Otherwise, release
+                    TX.get().unwrap().send(KeybindTrigger::Released(id))?
+                }
+            }
             _ => {
                 eprintln!("Unexpected output from GlobalShortcuts!");
             }
