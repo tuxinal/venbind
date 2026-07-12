@@ -685,6 +685,113 @@ mod tests {
     }
 
     #[test]
+    fn production_events_support_modifier_only_bindings() {
+        let cases = [
+            (VK_LSHIFT, false, uiohook_sys::MASK_SHIFT_L as u16, "shift"),
+            (VK_RSHIFT, false, uiohook_sys::MASK_SHIFT_R as u16, "shift"),
+            (VK_LMENU, false, uiohook_sys::MASK_ALT_L as u16, "alt"),
+            (VK_RMENU, true, uiohook_sys::MASK_ALT_R as u16, "alt"),
+            (VK_LCONTROL, false, uiohook_sys::MASK_CTRL_L as u16, "ctrl"),
+            (VK_RCONTROL, true, uiohook_sys::MASK_CTRL_R as u16, "ctrl"),
+            (VK_LWIN, true, uiohook_sys::MASK_META_L as u16, "meta"),
+            (VK_RWIN, true, uiohook_sys::MASK_META_R as u16, "meta"),
+        ];
+        for (vk, extended, mask, modifier) in cases {
+            let keybinds = keybind(modifier);
+            let mut state = WindowsEventState::default();
+            let scancode = libuiohook_scancode(vk, extended);
+            let press = keyboard_event(_event_type_EVENT_KEY_PRESSED, vk, scancode, mask);
+            let release = keyboard_event(_event_type_EVENT_KEY_RELEASED, vk, scancode, 0);
+
+            assert_eq!(
+                process_keyboard_event(&mut state, &keybinds, &press, resolve_pressed_key),
+                vec![KeybindTrigger::Pressed("binding".to_owned())],
+                "modifier-only press for {modifier}"
+            );
+            assert_eq!(
+                process_keyboard_event(&mut state, &keybinds, &release, resolve_pressed_key),
+                vec![KeybindTrigger::Released("binding".to_owned())],
+                "modifier-only release for {modifier}"
+            );
+            assert!(state.curr_down.keys.is_empty());
+            assert!(state.pressed_key_tokens.is_empty());
+        }
+    }
+
+    #[test]
+    fn production_binding_stays_active_while_unrelated_key_is_held() {
+        let keybinds = keybind("ctrl+space");
+        let mut state = WindowsEventState::default();
+        let ctrl_mask = uiohook_sys::MASK_CTRL_L as u16;
+
+        let ctrl_scancode = libuiohook_scancode(VK_LCONTROL, false);
+        let ctrl_press = keyboard_event(
+            _event_type_EVENT_KEY_PRESSED,
+            VK_LCONTROL,
+            ctrl_scancode,
+            ctrl_mask,
+        );
+        assert!(
+            process_keyboard_event(&mut state, &keybinds, &ctrl_press, resolve_pressed_key)
+                .is_empty()
+        );
+
+        let space_scancode = libuiohook_scancode(VK_SPACE, false);
+        let space_press = keyboard_event(
+            _event_type_EVENT_KEY_PRESSED,
+            VK_SPACE,
+            space_scancode,
+            ctrl_mask,
+        );
+        assert_eq!(
+            process_keyboard_event(&mut state, &keybinds, &space_press, resolve_pressed_key),
+            vec![KeybindTrigger::Pressed("binding".to_owned())]
+        );
+
+        let a = VIRTUAL_KEY(0x41);
+        let a_scancode = libuiohook_scancode(a, false);
+        let a_press = keyboard_event(_event_type_EVENT_KEY_PRESSED, a, a_scancode, ctrl_mask);
+        assert!(
+            process_keyboard_event(&mut state, &keybinds, &a_press, |_, _, _| {
+                Some("a".to_owned())
+            })
+            .is_empty()
+        );
+
+        let a_release = keyboard_event(_event_type_EVENT_KEY_RELEASED, a, a_scancode, ctrl_mask);
+        assert!(
+            process_keyboard_event(&mut state, &keybinds, &a_release, |_, _, _| {
+                panic!("release must use the cached unrelated-key token")
+            })
+            .is_empty()
+        );
+
+        let space_release = keyboard_event(
+            _event_type_EVENT_KEY_RELEASED,
+            VK_SPACE,
+            space_scancode,
+            ctrl_mask,
+        );
+        assert_eq!(
+            process_keyboard_event(&mut state, &keybinds, &space_release, resolve_pressed_key),
+            vec![KeybindTrigger::Released("binding".to_owned())]
+        );
+
+        let ctrl_release = keyboard_event(
+            _event_type_EVENT_KEY_RELEASED,
+            VK_LCONTROL,
+            ctrl_scancode,
+            0,
+        );
+        assert!(
+            process_keyboard_event(&mut state, &keybinds, &ctrl_release, resolve_pressed_key)
+                .is_empty()
+        );
+        assert!(state.curr_down.keys.is_empty());
+        assert!(state.pressed_key_tokens.is_empty());
+    }
+
+    #[test]
     fn production_events_cache_press_token_through_repeat_and_release() {
         let keybinds = keybind("press-time-token");
         let mut state = WindowsEventState::default();
