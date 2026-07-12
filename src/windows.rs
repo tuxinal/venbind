@@ -10,9 +10,10 @@ use uiohook_sys::{
 };
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyNameTextW, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_LCONTROL, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
-    VK_SPACE, VK_TAB,
+    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11,
+    VK_F12, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT,
+    VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RCONTROL,
+    VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 
 use crate::errors::{Result, VenbindError};
@@ -50,29 +51,28 @@ pub extern "C" fn dispatch_proc(event_ref: *mut _uiohook_event) {
     if event.type_ == _event_type_EVENT_KEY_PRESSED || event.type_ == _event_type_EVENT_KEY_RELEASED
     {
         let keycode = unsafe { event.data.keyboard.rawcode };
-        let scancode = unsafe { event.data.keyboard.keycode };
-        let key: Option<String> = match VIRTUAL_KEY(keycode) {
+        let vk = VIRTUAL_KEY(keycode);
+        let key: Option<String> = match vk {
             VK_SHIFT | VK_MENU | VK_CONTROL | VK_LWIN | VK_RWIN | VK_LSHIFT | VK_RSHIFT
             | VK_RCONTROL | VK_LCONTROL | VK_LMENU | VK_RMENU => None,
-            VK_ESCAPE | VK_BACK | VK_TAB | VK_DELETE | VK_RETURN | VK_SPACE => {
-                Some(get_key_name(scancode))
-            }
             _ => {
-                const BUF_SIZE: usize = 8;
-                let mut key_buffer: Vec<uiohook_sys::platform::wchar_t> = vec![0; BUF_SIZE];
-                let str_count = unsafe {
-                    uiohook_sys::platform::keycode_to_unicode(
-                        keycode as u32,
-                        key_buffer.as_mut_ptr(),
-                        BUF_SIZE.try_into().unwrap(),
-                    )
-                };
-                key_buffer.truncate(str_count.try_into().unwrap());
-                let key = OsString::from_wide(&key_buffer);
-                if !key.is_empty() {
-                    Some(key.to_string_lossy().to_lowercase())
+                if let Some(token) = common_named_key(vk) {
+                    Some(token.to_owned())
+                } else if is_printable_key(vk) {
+                    const BUF_SIZE: usize = 8;
+                    let mut key_buffer: Vec<uiohook_sys::platform::wchar_t> = vec![0; BUF_SIZE];
+                    let str_count = unsafe {
+                        uiohook_sys::platform::keycode_to_unicode(
+                            keycode as u32,
+                            key_buffer.as_mut_ptr(),
+                            BUF_SIZE.try_into().unwrap(),
+                        )
+                    };
+                    key_buffer.truncate(str_count.try_into().unwrap());
+                    let key = OsString::from_wide(&key_buffer);
+                    (!key.is_empty()).then(|| key.to_string_lossy().to_lowercase())
                 } else {
-                    Some(get_key_name(scancode))
+                    None
                 }
             }
         };
@@ -138,10 +138,93 @@ pub(crate) fn get_current_shortcut_internal() -> Result<String> {
     Ok(down.to_string())
 }
 
-fn get_key_name(scancode: u16) -> String {
-    let mut buf: Vec<u16> = vec![0; 16];
-    let str_count = unsafe { GetKeyNameTextW((scancode as i32) << 16, &mut buf) };
-    buf.truncate(str_count.try_into().unwrap());
-    let key = OsString::from_wide(&buf);
-    key.to_string_lossy().to_string()
+fn common_named_key(vk: VIRTUAL_KEY) -> Option<&'static str> {
+    Some(match vk {
+        VK_PRIOR => "pageup",
+        VK_NEXT => "pagedown",
+        VK_HOME => "home",
+        VK_END => "end",
+        VK_INSERT => "insert",
+        VK_DELETE => "delete",
+        VK_ESCAPE => "escape",
+        VK_RETURN => "enter",
+        VK_BACK => "backspace",
+        VK_TAB => "tab",
+        VK_SPACE => "space",
+        VK_UP => "up",
+        VK_DOWN => "down",
+        VK_LEFT => "left",
+        VK_RIGHT => "right",
+        VK_F1 => "f1",
+        VK_F2 => "f2",
+        VK_F3 => "f3",
+        VK_F4 => "f4",
+        VK_F5 => "f5",
+        VK_F6 => "f6",
+        VK_F7 => "f7",
+        VK_F8 => "f8",
+        VK_F9 => "f9",
+        VK_F10 => "f10",
+        VK_F11 => "f11",
+        VK_F12 => "f12",
+        _ => return None,
+    })
+}
+
+fn is_printable_key(vk: VIRTUAL_KEY) -> bool {
+    matches!(
+        vk.0,
+        0x30..=0x39 // 0-9
+            | 0x41..=0x5a // A-Z
+            | 0xba..=0xc0 // common OEM punctuation
+            | 0xdb..=0xdf // common OEM punctuation
+            | 0xe2 // VK_OEM_102
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_named_keys_use_stable_tokens() {
+        let cases = [
+            (VK_PRIOR, "pageup"),
+            (VK_NEXT, "pagedown"),
+            (VK_HOME, "home"),
+            (VK_END, "end"),
+            (VK_INSERT, "insert"),
+            (VK_DELETE, "delete"),
+            (VK_ESCAPE, "escape"),
+            (VK_RETURN, "enter"),
+            (VK_BACK, "backspace"),
+            (VK_TAB, "tab"),
+            (VK_SPACE, "space"),
+            (VK_UP, "up"),
+            (VK_DOWN, "down"),
+            (VK_LEFT, "left"),
+            (VK_RIGHT, "right"),
+            (VK_F1, "f1"),
+            (VK_F12, "f12"),
+        ];
+
+        for (vk, token) in cases {
+            assert_eq!(common_named_key(vk), Some(token));
+        }
+    }
+
+    #[test]
+    fn printable_and_unsupported_keys_do_not_use_named_tokens() {
+        for code in [0x30, 0x39, 0x41, 0x5a, 0xba, 0xc0, 0xdb, 0xdf, 0xe2] {
+            let vk = VIRTUAL_KEY(code);
+            assert!(is_printable_key(vk));
+            assert_eq!(common_named_key(vk), None);
+        }
+
+        for code in [0x00, 0x01, 0xad, 0xae, 0xaf] {
+            let vk = VIRTUAL_KEY(code);
+            assert!(!is_printable_key(vk));
+            assert_eq!(common_named_key(vk), None);
+        }
+    }
 }
