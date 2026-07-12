@@ -29,20 +29,35 @@ use crate::errors::{Result, VenbindError};
 use crate::structs::{KeybindId, KeybindInfo, KeybindTrigger, Keybinds, Shortcut};
 
 static KEYBINDS: LazyLock<Mutex<Keybinds>> = LazyLock::new(|| Mutex::new(Keybinds::default()));
-static CURR_DOWN: LazyLock<Mutex<Shortcut>> = LazyLock::new(|| {
-    Mutex::new(Shortcut {
-        shift: false,
-        alt: false,
-        ctrl: false,
-        meta: false,
-        keys: HashSet::new(),
-    })
-});
-static CURR_ACTIVE_KEYBINDS: LazyLock<Mutex<HashSet<KeybindId>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-static PRESSED_KEY_TOKENS: LazyLock<Mutex<HashMap<(u16, u16), String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static EVENT_STATE: LazyLock<Mutex<WindowsEventState>> =
+    LazyLock::new(|| Mutex::new(WindowsEventState::default()));
 static TX: OnceLock<Sender<KeybindTrigger>> = OnceLock::new();
+
+/// All deterministic state owned by the Windows keyboard event path.
+///
+/// Keeping this state together lets the real libuiohook event processor be
+/// exercised without starting a global hook or requiring an interactive desktop.
+struct WindowsEventState {
+    curr_down: Shortcut,
+    curr_active_keybinds: HashSet<KeybindId>,
+    pressed_key_tokens: HashMap<(u16, u16), String>,
+}
+
+impl Default for WindowsEventState {
+    fn default() -> Self {
+        Self {
+            curr_down: Shortcut {
+                shift: false,
+                alt: false,
+                ctrl: false,
+                meta: false,
+                keys: HashSet::new(),
+            },
+            curr_active_keybinds: HashSet::new(),
+            pressed_key_tokens: HashMap::new(),
+        }
+    }
+}
 
 pub(crate) fn start_keybinds_internal(tx: Sender<KeybindTrigger>, _: Option<String>) -> Result<()> {
     TX.set(tx).unwrap();
@@ -58,68 +73,104 @@ pub(crate) fn start_keybinds_internal(tx: Sender<KeybindTrigger>, _: Option<Stri
 
 #[no_mangle]
 pub extern "C" fn dispatch_proc(event_ref: *mut _uiohook_event) {
-    let event = unsafe { *event_ref };
-    if event.type_ == _event_type_EVENT_KEY_PRESSED || event.type_ == _event_type_EVENT_KEY_RELEASED
-    {
-        let keycode = unsafe { event.data.keyboard.rawcode };
-        let scancode = unsafe { event.data.keyboard.keycode };
-        let vk = VIRTUAL_KEY(keycode);
-        let physical_key = (keycode, scancode);
-        let key: Option<String> = match vk {
-            // Modifier keys are tracked via `event.mask`, never as a key token.
-            VK_SHIFT | VK_MENU | VK_CONTROL | VK_LWIN | VK_RWIN | VK_LSHIFT | VK_RSHIFT
-            | VK_RCONTROL | VK_LCONTROL | VK_LMENU | VK_RMENU => None,
-            _ => {
-                let mut pressed = PRESSED_KEY_TOKENS.lock().unwrap();
-                cached_key_token(
-                    &mut pressed,
-                    physical_key,
-                    event.type_ == _event_type_EVENT_KEY_PRESSED,
-                    || resolve_pressed_key(vk, scancode, keycode),
-                )
-            }
+    if event_ref.is_null() {
+        return;
+    }
+
+    // This callback runs on libuiohook's C hook thread. Catch any Rust panic so
+    // it can never unwind across the FFI boundary. Poisoned locks are handled as
+    // a dropped event for the same reason.
+    let _ = std::panic::catch_unwind(|| {
+        let event = unsafe { &*event_ref };
+        let triggers = {
+            let Ok(keybinds) = KEYBINDS.lock() else {
+                return;
+            };
+            let Ok(mut state) = EVENT_STATE.lock() else {
+                return;
+            };
+            process_keyboard_event(&mut state, &keybinds, event, resolve_pressed_key)
         };
 
-        let shift = event.mask & uiohook_sys::MASK_SHIFT as u16 != 0;
-        let alt = event.mask & uiohook_sys::MASK_ALT as u16 != 0;
-        let ctrl = event.mask & uiohook_sys::MASK_CTRL as u16 != 0;
-        let meta = event.mask & uiohook_sys::MASK_META as u16 != 0;
-
-        let mut curr_down = CURR_DOWN.lock().unwrap();
-        curr_down.alt = alt;
-        curr_down.shift = shift;
-        curr_down.ctrl = ctrl;
-        curr_down.meta = meta;
-        if let Some(key) = key {
-            if event.type_ == _event_type_EVENT_KEY_PRESSED {
-                curr_down.keys.insert(key);
-            } else {
-                curr_down.keys.remove(&key);
-            }
-        }
-        let keybinds = KEYBINDS.lock().unwrap();
-        let active: HashSet<String> = keybinds
-            .get_active_keybinds(&curr_down)
-            .into_iter()
-            .collect();
-        let mut curr_active_keybinds = CURR_ACTIVE_KEYBINDS.lock().unwrap();
-        let pressed_keybinds = active.difference(&curr_active_keybinds);
-        let released_keybinds = curr_active_keybinds.difference(&active);
-        // `dispatch_proc` is `extern "C"` and runs on libuiohook's hook thread, so
-        // a panic here would unwind across the FFI boundary (undefined behaviour).
-        // If the consumer has dropped the receiver the send simply fails -- ignore
-        // it rather than `.unwrap()`-ing and aborting the host process.
         if let Some(tx) = TX.get() {
-            for pressed in pressed_keybinds {
-                let _ = tx.send(KeybindTrigger::Pressed(pressed.clone()));
-            }
-            for released in released_keybinds {
-                let _ = tx.send(KeybindTrigger::Released(released.clone()));
+            for trigger in triggers {
+                // The receiver belongs to the embedding application and may have
+                // been dropped; that must not abort the host process.
+                let _ = tx.send(trigger);
             }
         }
-        curr_active_keybinds.clear();
-        curr_active_keybinds.extend(active);
+    });
+}
+
+/// Process one production-format libuiohook event without starting a hook.
+///
+/// The resolver is injectable only so printable-key cache behavior can be tested
+/// independently of the runner's active keyboard layout. Production passes
+/// [`resolve_pressed_key`] directly, and named-key tests do the same.
+fn process_keyboard_event<F>(
+    state: &mut WindowsEventState,
+    keybinds: &Keybinds,
+    event: &_uiohook_event,
+    resolve: F,
+) -> Vec<KeybindTrigger>
+where
+    F: FnOnce(VIRTUAL_KEY, u16, u16) -> Option<String>,
+{
+    let is_pressed = match event.type_ {
+        _event_type_EVENT_KEY_PRESSED => true,
+        _event_type_EVENT_KEY_RELEASED => false,
+        _ => return Vec::new(),
+    };
+
+    let (keycode, scancode) = unsafe { (event.data.keyboard.rawcode, event.data.keyboard.keycode) };
+    let vk = VIRTUAL_KEY(keycode);
+    let physical_key = (keycode, scancode);
+    let key = match vk {
+        // Modifier keys are tracked via `event.mask`, never as a key token.
+        VK_SHIFT | VK_MENU | VK_CONTROL | VK_LWIN | VK_RWIN | VK_LSHIFT | VK_RSHIFT
+        | VK_RCONTROL | VK_LCONTROL | VK_LMENU | VK_RMENU => None,
+        _ => cached_key_token(
+            &mut state.pressed_key_tokens,
+            physical_key,
+            is_pressed,
+            || resolve(vk, scancode, keycode),
+        ),
+    };
+
+    state.curr_down.shift = event.mask & uiohook_sys::MASK_SHIFT as u16 != 0;
+    state.curr_down.alt = event.mask & uiohook_sys::MASK_ALT as u16 != 0;
+    state.curr_down.ctrl = event.mask & uiohook_sys::MASK_CTRL as u16 != 0;
+    state.curr_down.meta = event.mask & uiohook_sys::MASK_META as u16 != 0;
+    if let Some(key) = key {
+        if is_pressed {
+            state.curr_down.keys.insert(key);
+        } else {
+            state.curr_down.keys.remove(&key);
+        }
     }
+
+    let active: HashSet<KeybindId> = keybinds
+        .get_active_keybinds(&state.curr_down)
+        .into_iter()
+        .collect();
+    let mut pressed: Vec<KeybindId> = active
+        .difference(&state.curr_active_keybinds)
+        .cloned()
+        .collect();
+    let mut released: Vec<KeybindId> = state
+        .curr_active_keybinds
+        .difference(&active)
+        .cloned()
+        .collect();
+    pressed.sort_unstable();
+    released.sort_unstable();
+
+    state.curr_active_keybinds = active;
+    pressed
+        .into_iter()
+        .map(KeybindTrigger::Pressed)
+        .chain(released.into_iter().map(KeybindTrigger::Released))
+        .collect()
 }
 
 /// Returns one stable token for the lifetime of a physical key press.
@@ -156,6 +207,14 @@ fn resolve_pressed_key(vk: VIRTUAL_KEY, scancode: u16, keycode: u16) -> Option<S
         return Some(token.to_owned());
     }
 
+    // Keep unsupported non-character VK groups bounded. Common printable keys
+    // are alphanumerics plus the layout-dependent OEM punctuation keys; IME,
+    // packet, gamepad, reserved, and legacy terminal ranges are not sent through
+    // libuiohook's layout resolver.
+    if !is_printable_vk(vk) {
+        return None;
+    }
+
     // Printable keys -> their lowercased unicode character.
     const BUF_SIZE: usize = 8;
     let mut key_buffer: Vec<uiohook_sys::platform::wchar_t> = vec![0; BUF_SIZE];
@@ -166,9 +225,21 @@ fn resolve_pressed_key(vk: VIRTUAL_KEY, scancode: u16, keycode: u16) -> Option<S
             BUF_SIZE.try_into().unwrap(),
         )
     };
-    key_buffer.truncate(str_count.try_into().unwrap());
+    let str_count = usize::try_from(str_count).unwrap_or(BUF_SIZE).min(BUF_SIZE);
+    key_buffer.truncate(str_count);
     let key = OsString::from_wide(&key_buffer);
     (!key.is_empty()).then(|| key.to_string_lossy().to_lowercase())
+}
+
+fn is_printable_vk(vk: VIRTUAL_KEY) -> bool {
+    matches!(
+        vk.0,
+        0x30..=0x39 // 0-9
+            | 0x41..=0x5a // A-Z
+            | 0xba..=0xc0 // common OEM punctuation
+            | 0xdb..=0xdf // common OEM punctuation
+            | 0xe2 // VK_OEM_102
+    )
 }
 
 pub(crate) fn set_keybinds_internal(keybinds: Vec<KeybindInfo>) -> Result<()> {
@@ -186,8 +257,8 @@ pub(crate) fn set_keybinds_internal(keybinds: Vec<KeybindInfo>) -> Result<()> {
 }
 
 pub(crate) fn get_current_shortcut_internal() -> Result<String> {
-    let down = CURR_DOWN.lock().unwrap();
-    Ok(down.to_string())
+    let state = EVENT_STATE.lock().unwrap();
+    Ok(state.curr_down.to_string())
 }
 
 /// Maps a Windows virtual-key code for a named / non-printable key to venbind's
@@ -319,89 +390,150 @@ mod tests {
     use crate::structs::tokens;
     use std::cell::Cell;
 
-    #[test]
-    fn named_keys_map_to_canonical_tokens() {
-        assert_eq!(vk_to_token(VK_PRIOR, 0), Some(tokens::PAGE_UP));
-        assert_eq!(vk_to_token(VK_NEXT, 0), Some(tokens::PAGE_DOWN));
-        assert_eq!(vk_to_token(VK_SPACE, 0), Some(tokens::SPACE));
-        assert_eq!(
-            vk_to_token(VK_RETURN, uiohook_sys::VC_ENTER as u16),
-            Some(tokens::ENTER)
+    const LLKHF_EXTENDED: u32 = 0x01;
+
+    fn libuiohook_scancode(vk: VIRTUAL_KEY, extended: bool) -> u16 {
+        unsafe {
+            uiohook_sys::platform::keycode_to_scancode(
+                u32::from(vk.0),
+                if extended { LLKHF_EXTENDED } else { 0 },
+            )
+        }
+    }
+
+    fn keyboard_event(type_: i32, vk: VIRTUAL_KEY, scancode: u16, mask: u16) -> _uiohook_event {
+        let mut event: _uiohook_event = unsafe { std::mem::zeroed() };
+        event.type_ = type_;
+        event.mask = mask;
+        unsafe {
+            event.data.keyboard.keycode = scancode;
+            event.data.keyboard.rawcode = vk.0;
+            event.data.keyboard.keychar = uiohook_sys::CHAR_UNDEFINED as u16;
+        }
+        event
+    }
+
+    fn keybind(shortcut: &str) -> Keybinds {
+        let mut keybinds = Keybinds::default();
+        keybinds.register_keybind(
+            Shortcut::from_string(shortcut.to_owned()),
+            "binding".to_owned(),
         );
-        assert_eq!(vk_to_token(VK_F5, 0), Some(tokens::F5));
-        assert_eq!(vk_to_token(VK_NUMPAD7, 0), Some(tokens::NUMPAD7));
+        keybinds
+    }
+
+    fn assert_named_press_and_release(vk: VIRTUAL_KEY, extended: bool, token: &str) {
+        let keybinds = keybind(token);
+        let mut state = WindowsEventState::default();
+        let scancode = libuiohook_scancode(vk, extended);
+        let press = keyboard_event(_event_type_EVENT_KEY_PRESSED, vk, scancode, 0);
+        let release = keyboard_event(_event_type_EVENT_KEY_RELEASED, vk, scancode, 0);
+
+        assert_eq!(
+            process_keyboard_event(&mut state, &keybinds, &press, resolve_pressed_key),
+            vec![KeybindTrigger::Pressed("binding".to_owned())],
+            "press VK {:#x}, scancode {scancode:#x}",
+            vk.0
+        );
+        assert!(state.curr_down.keys.contains(token));
+        assert_eq!(
+            process_keyboard_event(&mut state, &keybinds, &release, resolve_pressed_key),
+            vec![KeybindTrigger::Released("binding".to_owned())],
+            "release VK {:#x}, scancode {scancode:#x}",
+            vk.0
+        );
+        assert!(state.curr_down.keys.is_empty());
+        assert!(state.pressed_key_tokens.is_empty());
     }
 
     #[test]
-    fn extended_named_keys_map_to_canonical_tokens() {
+    fn production_events_cover_navigation_editing_whitespace_arrows_and_f1_to_f24() {
         let cases = [
-            (VK_PRIOR, tokens::PAGE_UP),
-            (VK_NEXT, tokens::PAGE_DOWN),
-            (VK_HOME, tokens::HOME),
-            (VK_END, tokens::END),
-            (VK_INSERT, tokens::INSERT),
-            (VK_DELETE, tokens::DELETE),
-            (VK_ESCAPE, tokens::ESCAPE),
-            (VK_BACK, tokens::BACKSPACE),
-            (VK_TAB, tokens::TAB),
-            (VK_SPACE, tokens::SPACE),
-            (VK_UP, tokens::UP),
-            (VK_DOWN, tokens::DOWN),
-            (VK_LEFT, tokens::LEFT),
-            (VK_RIGHT, tokens::RIGHT),
-            (VK_CAPITAL, tokens::CAPS_LOCK),
-            (VK_NUMLOCK, tokens::NUM_LOCK),
-            (VK_SCROLL, tokens::SCROLL_LOCK),
-            (VK_SNAPSHOT, tokens::PRINT_SCREEN),
-            (VK_PAUSE, tokens::PAUSE),
-            (VK_APPS, tokens::MENU),
-            (VK_CANCEL, tokens::CANCEL),
-            (VK_CLEAR, tokens::CLEAR),
-            (VK_SELECT, tokens::SELECT),
-            (VK_PRINT, tokens::PRINT),
-            (VK_EXECUTE, tokens::EXECUTE),
-            (VK_HELP, tokens::HELP),
-            (VK_SLEEP, tokens::SLEEP),
-            (VK_F1, tokens::F1),
-            (VK_F2, tokens::F2),
-            (VK_F3, tokens::F3),
-            (VK_F4, tokens::F4),
-            (VK_F5, tokens::F5),
-            (VK_F6, tokens::F6),
-            (VK_F7, tokens::F7),
-            (VK_F8, tokens::F8),
-            (VK_F9, tokens::F9),
-            (VK_F10, tokens::F10),
-            (VK_F11, tokens::F11),
-            (VK_F12, tokens::F12),
-            (VK_F13, tokens::F13),
-            (VK_F14, tokens::F14),
-            (VK_F15, tokens::F15),
-            (VK_F16, tokens::F16),
-            (VK_F17, tokens::F17),
-            (VK_F18, tokens::F18),
-            (VK_F19, tokens::F19),
-            (VK_F20, tokens::F20),
-            (VK_F21, tokens::F21),
-            (VK_F22, tokens::F22),
-            (VK_F23, tokens::F23),
-            (VK_F24, tokens::F24),
-            (VK_NUMPAD0, tokens::NUMPAD0),
-            (VK_NUMPAD1, tokens::NUMPAD1),
-            (VK_NUMPAD2, tokens::NUMPAD2),
-            (VK_NUMPAD3, tokens::NUMPAD3),
-            (VK_NUMPAD4, tokens::NUMPAD4),
-            (VK_NUMPAD5, tokens::NUMPAD5),
-            (VK_NUMPAD6, tokens::NUMPAD6),
-            (VK_NUMPAD7, tokens::NUMPAD7),
-            (VK_NUMPAD8, tokens::NUMPAD8),
-            (VK_NUMPAD9, tokens::NUMPAD9),
-            (VK_ADD, tokens::NUMPAD_ADD),
-            (VK_SUBTRACT, tokens::NUMPAD_SUBTRACT),
-            (VK_MULTIPLY, tokens::NUMPAD_MULTIPLY),
-            (VK_DIVIDE, tokens::NUMPAD_DIVIDE),
-            (VK_DECIMAL, tokens::NUMPAD_DECIMAL),
-            (VK_SEPARATOR, tokens::NUMPAD_SEPARATOR),
+            (VK_PRIOR, true, tokens::PAGE_UP),
+            (VK_NEXT, true, tokens::PAGE_DOWN),
+            (VK_HOME, true, tokens::HOME),
+            (VK_END, true, tokens::END),
+            (VK_INSERT, true, tokens::INSERT),
+            (VK_DELETE, true, tokens::DELETE),
+            (VK_ESCAPE, false, tokens::ESCAPE),
+            (VK_RETURN, false, tokens::ENTER),
+            (VK_BACK, false, tokens::BACKSPACE),
+            (VK_TAB, false, tokens::TAB),
+            (VK_SPACE, false, tokens::SPACE),
+            (VK_UP, true, tokens::UP),
+            (VK_DOWN, true, tokens::DOWN),
+            (VK_LEFT, true, tokens::LEFT),
+            (VK_RIGHT, true, tokens::RIGHT),
+            (VK_F1, false, tokens::F1),
+            (VK_F2, false, tokens::F2),
+            (VK_F3, false, tokens::F3),
+            (VK_F4, false, tokens::F4),
+            (VK_F5, false, tokens::F5),
+            (VK_F6, false, tokens::F6),
+            (VK_F7, false, tokens::F7),
+            (VK_F8, false, tokens::F8),
+            (VK_F9, false, tokens::F9),
+            (VK_F10, false, tokens::F10),
+            (VK_F11, false, tokens::F11),
+            (VK_F12, false, tokens::F12),
+            (VK_F13, false, tokens::F13),
+            (VK_F14, false, tokens::F14),
+            (VK_F15, false, tokens::F15),
+            (VK_F16, false, tokens::F16),
+            (VK_F17, false, tokens::F17),
+            (VK_F18, false, tokens::F18),
+            (VK_F19, false, tokens::F19),
+            (VK_F20, false, tokens::F20),
+            (VK_F21, false, tokens::F21),
+            (VK_F22, false, tokens::F22),
+            (VK_F23, false, tokens::F23),
+            (VK_F24, false, tokens::F24),
+        ];
+        for (vk, extended, token) in cases {
+            assert_named_press_and_release(vk, extended, token);
+        }
+    }
+
+    #[test]
+    fn production_events_cover_locks_keypad_and_common_system_keys() {
+        let cases = [
+            (VK_CAPITAL, false, tokens::CAPS_LOCK),
+            (VK_NUMLOCK, true, tokens::NUM_LOCK),
+            (VK_SCROLL, false, tokens::SCROLL_LOCK),
+            (VK_SNAPSHOT, true, tokens::PRINT_SCREEN),
+            (VK_PAUSE, false, tokens::PAUSE),
+            (VK_APPS, true, tokens::MENU),
+            (VK_CANCEL, false, tokens::CANCEL),
+            (VK_SELECT, false, tokens::SELECT),
+            (VK_PRINT, false, tokens::PRINT),
+            (VK_EXECUTE, false, tokens::EXECUTE),
+            (VK_HELP, false, tokens::HELP),
+            (VK_SLEEP, false, tokens::SLEEP),
+            (VK_NUMPAD0, false, tokens::NUMPAD0),
+            (VK_NUMPAD1, false, tokens::NUMPAD1),
+            (VK_NUMPAD2, false, tokens::NUMPAD2),
+            (VK_NUMPAD3, false, tokens::NUMPAD3),
+            (VK_NUMPAD4, false, tokens::NUMPAD4),
+            (VK_NUMPAD5, false, tokens::NUMPAD5),
+            (VK_NUMPAD6, false, tokens::NUMPAD6),
+            (VK_NUMPAD7, false, tokens::NUMPAD7),
+            (VK_NUMPAD8, false, tokens::NUMPAD8),
+            (VK_NUMPAD9, false, tokens::NUMPAD9),
+            (VK_ADD, false, tokens::NUMPAD_ADD),
+            (VK_SUBTRACT, false, tokens::NUMPAD_SUBTRACT),
+            (VK_MULTIPLY, false, tokens::NUMPAD_MULTIPLY),
+            (VK_DIVIDE, true, tokens::NUMPAD_DIVIDE),
+            (VK_DECIMAL, false, tokens::NUMPAD_DECIMAL),
+            (VK_SEPARATOR, false, tokens::NUMPAD_SEPARATOR),
+        ];
+        for (vk, extended, token) in cases {
+            assert_named_press_and_release(vk, extended, token);
+        }
+    }
+
+    #[test]
+    fn production_events_cover_volume_media_browser_and_launch_keys() {
+        let cases = [
             (VK_VOLUME_MUTE, tokens::VOLUME_MUTE),
             (VK_VOLUME_DOWN, tokens::VOLUME_DOWN),
             (VK_VOLUME_UP, tokens::VOLUME_UP),
@@ -422,98 +554,206 @@ mod tests {
             (VK_LAUNCH_APP2, tokens::LAUNCH_APP2),
         ];
         for (vk, token) in cases {
-            assert_eq!(vk_to_token(vk, 0), Some(token), "VK {:#x}", vk.0);
-        }
-        assert_eq!(
-            vk_to_token(VK_RETURN, uiohook_sys::VC_ENTER as u16),
-            Some(tokens::ENTER)
-        );
-        assert_eq!(
-            vk_to_token(VK_RETURN, uiohook_sys::VC_KP_ENTER as u16),
-            Some(tokens::NUMPAD_ENTER)
-        );
-    }
-
-    #[test]
-    fn modifier_and_unknown_virtual_keys_are_not_named_tokens() {
-        for vk in [
-            VK_SHIFT,
-            VK_LSHIFT,
-            VK_RSHIFT,
-            VK_CONTROL,
-            VK_LCONTROL,
-            VK_RCONTROL,
-            VK_MENU,
-            VK_LMENU,
-            VK_RMENU,
-            VK_LWIN,
-            VK_RWIN,
-            VIRTUAL_KEY(0),
-        ] {
-            assert_eq!(vk_to_token(vk, 0), None, "VK {:#x}", vk.0);
+            assert_named_press_and_release(vk, false, token);
         }
     }
 
     #[test]
-    fn numpad_tokens_are_stable_across_numlock_state() {
-        let cases = [
-            (VK_INSERT, uiohook_sys::VC_INSERT, tokens::NUMPAD0),
-            (VK_END, uiohook_sys::VC_END, tokens::NUMPAD1),
-            (VK_DOWN, uiohook_sys::VC_DOWN, tokens::NUMPAD2),
-            (VK_NEXT, uiohook_sys::VC_PAGE_DOWN, tokens::NUMPAD3),
-            (VK_LEFT, uiohook_sys::VC_LEFT, tokens::NUMPAD4),
-            (VK_CLEAR, uiohook_sys::VC_CLEAR, tokens::NUMPAD5),
-            (VK_RIGHT, uiohook_sys::VC_RIGHT, tokens::NUMPAD6),
-            (VK_HOME, uiohook_sys::VC_HOME, tokens::NUMPAD7),
-            (VK_UP, uiohook_sys::VC_UP, tokens::NUMPAD8),
-            (VK_PRIOR, uiohook_sys::VC_PAGE_UP, tokens::NUMPAD9),
-            (VK_DELETE, uiohook_sys::VC_DELETE, tokens::NUMPAD_DECIMAL),
+    fn vendored_scancode_translation_distinguishes_enter_and_navigation_sources() {
+        assert_eq!(
+            libuiohook_scancode(VK_RETURN, false),
+            uiohook_sys::VC_ENTER as u16
+        );
+        assert_eq!(
+            libuiohook_scancode(VK_RETURN, true),
+            uiohook_sys::VC_KP_ENTER as u16
+        );
+
+        let navigation = [
+            (VK_INSERT, uiohook_sys::VC_INSERT, uiohook_sys::VC_KP_INSERT),
+            (VK_END, uiohook_sys::VC_END, uiohook_sys::VC_KP_END),
+            (VK_DOWN, uiohook_sys::VC_DOWN, uiohook_sys::VC_KP_DOWN),
+            (
+                VK_NEXT,
+                uiohook_sys::VC_PAGE_DOWN,
+                uiohook_sys::VC_KP_PAGE_DOWN,
+            ),
+            (VK_LEFT, uiohook_sys::VC_LEFT, uiohook_sys::VC_KP_LEFT),
+            (VK_RIGHT, uiohook_sys::VC_RIGHT, uiohook_sys::VC_KP_RIGHT),
+            (VK_HOME, uiohook_sys::VC_HOME, uiohook_sys::VC_KP_HOME),
+            (VK_UP, uiohook_sys::VC_UP, uiohook_sys::VC_KP_UP),
+            (
+                VK_PRIOR,
+                uiohook_sys::VC_PAGE_UP,
+                uiohook_sys::VC_KP_PAGE_UP,
+            ),
+            (VK_DELETE, uiohook_sys::VC_DELETE, uiohook_sys::VC_KP_DELETE),
         ];
-        for (vk, scancode, token) in cases {
-            assert_eq!(vk_to_token(vk, scancode as u16), Some(token));
+        for (vk, non_extended, extended) in navigation {
+            assert_eq!(libuiohook_scancode(vk, false), non_extended as u16);
+            assert_eq!(libuiohook_scancode(vk, true), extended as u16);
         }
+
+        // The vendored helper does not branch on LLKHF_EXTENDED for VK_CLEAR.
         assert_eq!(
-            vk_to_token(VK_RETURN, uiohook_sys::VC_KP_ENTER as u16),
-            Some(tokens::NUMPAD_ENTER)
+            libuiohook_scancode(VK_CLEAR, false),
+            uiohook_sys::VC_CLEAR as u16
+        );
+        assert_eq!(
+            libuiohook_scancode(VK_CLEAR, true),
+            uiohook_sys::VC_CLEAR as u16
         );
     }
 
     #[test]
-    fn press_repeat_and_release_share_one_resolved_token() {
-        let mut pressed = HashMap::new();
-        let resolver_calls = Cell::new(0);
-        let physical_key = (VK_F5.0, uiohook_sys::VC_F5 as u16);
+    fn production_events_distinguish_main_enter_numpad_enter_and_numlock_off_keypad() {
+        assert_named_press_and_release(VK_RETURN, false, tokens::ENTER);
+        assert_named_press_and_release(VK_RETURN, true, tokens::NUMPAD_ENTER);
 
-        let first = cached_key_token(&mut pressed, physical_key, true, || {
+        let cases = [
+            (VK_INSERT, tokens::NUMPAD0, tokens::INSERT),
+            (VK_END, tokens::NUMPAD1, tokens::END),
+            (VK_DOWN, tokens::NUMPAD2, tokens::DOWN),
+            (VK_NEXT, tokens::NUMPAD3, tokens::PAGE_DOWN),
+            (VK_LEFT, tokens::NUMPAD4, tokens::LEFT),
+            (VK_RIGHT, tokens::NUMPAD6, tokens::RIGHT),
+            (VK_HOME, tokens::NUMPAD7, tokens::HOME),
+            (VK_UP, tokens::NUMPAD8, tokens::UP),
+            (VK_PRIOR, tokens::NUMPAD9, tokens::PAGE_UP),
+            (VK_DELETE, tokens::NUMPAD_DECIMAL, tokens::DELETE),
+        ];
+        for (vk, keypad_token, dedicated_token) in cases {
+            assert_named_press_and_release(vk, false, keypad_token);
+            assert_named_press_and_release(vk, true, dedicated_token);
+        }
+
+        // VK_CLEAR always has VC_CLEAR in this vendored helper, so the only
+        // reliable physical interpretation is Numpad 5 with NumLock off.
+        assert_named_press_and_release(VK_CLEAR, false, tokens::NUMPAD5);
+    }
+
+    #[test]
+    fn production_events_track_all_modifier_masks_without_sided_tokens() {
+        let cases = [
+            (VK_LSHIFT, false, uiohook_sys::MASK_SHIFT_L as u16, "shift"),
+            (VK_RSHIFT, false, uiohook_sys::MASK_SHIFT_R as u16, "shift"),
+            (VK_LMENU, false, uiohook_sys::MASK_ALT_L as u16, "alt"),
+            (VK_RMENU, true, uiohook_sys::MASK_ALT_R as u16, "alt"),
+            (VK_LCONTROL, false, uiohook_sys::MASK_CTRL_L as u16, "ctrl"),
+            (VK_RCONTROL, true, uiohook_sys::MASK_CTRL_R as u16, "ctrl"),
+            (VK_LWIN, true, uiohook_sys::MASK_META_L as u16, "meta"),
+            (VK_RWIN, true, uiohook_sys::MASK_META_R as u16, "meta"),
+        ];
+        for (vk, extended, mask, modifier) in cases {
+            let keybinds = keybind(&format!("{modifier}+f5"));
+            let mut state = WindowsEventState::default();
+            let modifier_scancode = libuiohook_scancode(vk, extended);
+            let modifier_press =
+                keyboard_event(_event_type_EVENT_KEY_PRESSED, vk, modifier_scancode, mask);
+            assert!(process_keyboard_event(
+                &mut state,
+                &keybinds,
+                &modifier_press,
+                resolve_pressed_key
+            )
+            .is_empty());
+            assert!(state.curr_down.keys.is_empty());
+            assert!(state.pressed_key_tokens.is_empty());
+
+            let f5_scancode = libuiohook_scancode(VK_F5, false);
+            let f5_press = keyboard_event(_event_type_EVENT_KEY_PRESSED, VK_F5, f5_scancode, mask);
+            assert_eq!(
+                process_keyboard_event(&mut state, &keybinds, &f5_press, resolve_pressed_key),
+                vec![KeybindTrigger::Pressed("binding".to_owned())]
+            );
+            let f5_release =
+                keyboard_event(_event_type_EVENT_KEY_RELEASED, VK_F5, f5_scancode, mask);
+            assert_eq!(
+                process_keyboard_event(&mut state, &keybinds, &f5_release, resolve_pressed_key),
+                vec![KeybindTrigger::Released("binding".to_owned())]
+            );
+            let modifier_release =
+                keyboard_event(_event_type_EVENT_KEY_RELEASED, vk, modifier_scancode, 0);
+            assert!(process_keyboard_event(
+                &mut state,
+                &keybinds,
+                &modifier_release,
+                resolve_pressed_key
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn production_events_cache_press_token_through_repeat_and_release() {
+        let keybinds = keybind("press-time-token");
+        let mut state = WindowsEventState::default();
+        let resolver_calls = Cell::new(0);
+        let scancode = libuiohook_scancode(VIRTUAL_KEY(0x41), false);
+        let press = keyboard_event(
+            _event_type_EVENT_KEY_PRESSED,
+            VIRTUAL_KEY(0x41),
+            scancode,
+            0,
+        );
+        let release = keyboard_event(
+            _event_type_EVENT_KEY_RELEASED,
+            VIRTUAL_KEY(0x41),
+            scancode,
+            0,
+        );
+
+        let first = process_keyboard_event(&mut state, &keybinds, &press, |_, _, _| {
             resolver_calls.set(resolver_calls.get() + 1);
-            Some(tokens::F5.to_owned())
+            Some("press-time-token".to_owned())
         });
-        let repeat = cached_key_token(&mut pressed, physical_key, true, || {
+        let repeat = process_keyboard_event(&mut state, &keybinds, &press, |_, _, _| {
             resolver_calls.set(resolver_calls.get() + 1);
             Some("wrong-repeat-token".to_owned())
         });
-        let released = cached_key_token(&mut pressed, physical_key, false, || {
+        let released = process_keyboard_event(&mut state, &keybinds, &release, |_, _, _| {
             resolver_calls.set(resolver_calls.get() + 1);
             Some("wrong-release-token".to_owned())
         });
 
-        assert_eq!(first.as_deref(), Some(tokens::F5));
-        assert_eq!(repeat.as_deref(), Some(tokens::F5));
-        assert_eq!(released.as_deref(), Some(tokens::F5));
+        assert_eq!(first, vec![KeybindTrigger::Pressed("binding".to_owned())]);
+        assert!(
+            repeat.is_empty(),
+            "auto-repeat must not retrigger a keybind"
+        );
+        assert_eq!(
+            released,
+            vec![KeybindTrigger::Released("binding".to_owned())]
+        );
         assert_eq!(resolver_calls.get(), 1);
-        assert!(pressed.is_empty());
+        assert!(state.curr_down.keys.is_empty());
+        assert!(state.pressed_key_tokens.is_empty());
     }
 
     #[test]
-    fn release_without_a_press_does_not_resolve_or_stick() {
-        let mut pressed = HashMap::new();
-        let resolver_called = Cell::new(false);
-        let released = cached_key_token(&mut pressed, (0x41, 0x1e), false, || {
-            resolver_called.set(true);
-            Some("a".to_owned())
-        });
-        assert_eq!(released, None);
-        assert!(!resolver_called.get());
-        assert!(pressed.is_empty());
+    fn production_events_ignore_unknown_and_unsupported_virtual_keys() {
+        let keybinds = keybind("unexpected");
+        for vk in [
+            VIRTUAL_KEY(0x00), // undefined
+            VIRTUAL_KEY(0xe5), // VK_PROCESSKEY
+            VIRTUAL_KEY(0xe7), // VK_PACKET
+            VIRTUAL_KEY(0xc3), // VK_GAMEPAD_A
+            VIRTUAL_KEY(0xf6), // VK_ATTN
+        ] {
+            let mut state = WindowsEventState::default();
+            let scancode = libuiohook_scancode(vk, false);
+            let press = keyboard_event(_event_type_EVENT_KEY_PRESSED, vk, scancode, 0);
+            let release = keyboard_event(_event_type_EVENT_KEY_RELEASED, vk, scancode, 0);
+            assert!(
+                process_keyboard_event(&mut state, &keybinds, &press, resolve_pressed_key)
+                    .is_empty()
+            );
+            assert!(
+                process_keyboard_event(&mut state, &keybinds, &release, resolve_pressed_key)
+                    .is_empty()
+            );
+            assert!(state.curr_down.keys.is_empty());
+            assert!(state.pressed_key_tokens.is_empty());
+        }
     }
 }

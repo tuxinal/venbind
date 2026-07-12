@@ -17,6 +17,7 @@ pub struct KeybindInfo {
     pub shortcut: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum KeybindTrigger {
     Pressed(KeybindId),
     Released(KeybindId),
