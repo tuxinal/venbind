@@ -225,21 +225,38 @@ pub(crate) struct Shortcut {
 impl Shortcut {
     pub fn from_string(keybind: String) -> Self {
         let lowercase_keybind = keybind.to_lowercase();
-        let keys = lowercase_keybind.split("+");
+        // `+` is both the shortcut separator and a printable key. A standalone
+        // plus is written as "+"; with modifiers the trailing doubled separator
+        // identifies it (for example, "ctrl++"). Strip only that final marker
+        // before parsing the other shortcut components.
+        let has_literal_plus = lowercase_keybind == "+" || lowercase_keybind.ends_with("++");
+        let components = if has_literal_plus {
+            lowercase_keybind.strip_suffix('+').unwrap()
+        } else {
+            &lowercase_keybind
+        };
         let mut shift = false;
         let mut alt = false;
         let mut ctrl = false;
         let mut meta = false;
         let mut chars = HashSet::new();
-        keys.for_each(|x| match x {
-            "shift" => shift = true,
-            "alt" => alt = true,
-            "ctrl" => ctrl = true,
-            "meta" => meta = true,
-            _ => {
-                chars.insert(x.to_owned());
+        components.split('+').for_each(|x| {
+            if has_literal_plus && x.is_empty() {
+                return;
+            }
+            match x {
+                "shift" => shift = true,
+                "alt" => alt = true,
+                "ctrl" => ctrl = true,
+                "meta" => meta = true,
+                _ => {
+                    chars.insert(x.to_owned());
+                }
             }
         });
+        if has_literal_plus {
+            chars.insert("+".to_owned());
+        }
         Self {
             shift,
             alt,
@@ -275,7 +292,7 @@ impl ToString for Shortcut {
                     .collect::<String>(),
             );
         }
-        res.trim_start_matches("+").to_owned()
+        res.strip_prefix('+').unwrap_or(&res).to_owned()
     }
 }
 
@@ -321,6 +338,18 @@ mod tests {
         assert!(s.ctrl && s.shift && !s.alt && !s.meta);
         let expected: HashSet<String> = ["pageup"].iter().map(|s| s.to_string()).collect();
         assert_eq!(s.keys, expected);
+    }
+
+    #[test]
+    fn literal_plus_round_trips_as_a_printable_key() {
+        let plus = Shortcut::from_string("+".to_owned());
+        assert_eq!(plus.keys, HashSet::from(["+".to_owned()]));
+        assert_eq!(plus.to_string(), "+");
+
+        let ctrl_plus = Shortcut::from_string("ctrl++".to_owned());
+        assert!(ctrl_plus.ctrl);
+        assert_eq!(ctrl_plus.keys, HashSet::from(["+".to_owned()]));
+        assert_eq!(ctrl_plus.to_string(), "CTRL++");
     }
 
     #[test]

@@ -731,6 +731,38 @@ mod tests {
     }
 
     #[test]
+    fn production_events_match_printable_azerty_number_and_punctuation_tokens() {
+        let tokens = [
+            "a", "z", "0", "1", "[", "]", "#", ";", "'", ",", ".", "/", "?", "<", ">", ":", "@",
+            "~", "}", "{", "!", "\"", "£", "$", "%", "^", "&", "*", "(", ")", "_", "+", "é", "è",
+            "ç", "à",
+        ];
+        for token in tokens {
+            let keybinds = keybind(token);
+            let mut state = WindowsEventState::default();
+            let vk = VIRTUAL_KEY(0x41);
+            let scancode = libuiohook_scancode(vk, false);
+            let press = keyboard_event(_event_type_EVENT_KEY_PRESSED, vk, scancode, 0);
+            let release = keyboard_event(_event_type_EVENT_KEY_RELEASED, vk, scancode, 0);
+
+            assert_eq!(
+                process_keyboard_event(&mut state, &keybinds, &press, |_, _, _| {
+                    Some(token.to_owned())
+                }),
+                vec![KeybindTrigger::Pressed("binding".to_owned())],
+                "printable press token {token:?}"
+            );
+            assert_eq!(
+                process_keyboard_event(&mut state, &keybinds, &release, |_, _, _| {
+                    panic!("release must use the cached printable token")
+                }),
+                vec![KeybindTrigger::Released("binding".to_owned())],
+                "printable release token {token:?}"
+            );
+        }
+    }
+
+    #[test]
     fn production_events_ignore_unknown_and_unsupported_virtual_keys() {
         let keybinds = keybind("unexpected");
         for vk in [
